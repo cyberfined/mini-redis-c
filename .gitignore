@@ -1,0 +1,6 @@
+*
+!*.*
+*.o
+*.py
+!Makefile
+!LICENSE
