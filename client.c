@@ -3,18 +3,44 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <assert.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include "proto.h"
+#include "util.h"
 
+#define MAX_ERROR_LEN              256
 #define OUTPUT_BUF_SIZE            (2 * (MAX_RESPONSE_LEN + MAX_ERROR_LEN))
 #define RESPONSE_IS_TOO_LONG_ERROR "ERR: response is too long\n"
 #define WRONG_RESPONSE_TYPE_ERROR  "ERR: wrong response status type\n"
-#define ZERO_SIZE_ARRAY_ERROR      "ERR: zero size arrays are not supported\n"
 #define COMMAND_IS_TOO_LONG_ERROR  "ERR: command is too long\n"
 #define EMPTY_REQUEST_ERROR        "ERR: empty request\n"
+#define UNKNOWN_ERROR_CODE         "unknown"
+
+typedef struct {
+    char   *message;
+    size_t len;
+} ErrorMessage;
+
+#define ERROR_MESSAGE(type, msg) [type] = { msg, sizeof(msg) - 1 }
+
+static const ErrorMessage error_messages[] = {
+    ERROR_MESSAGE(ERR_COMMAND_IS_TOO_LONG, "command is too long"),
+    ERROR_MESSAGE(ERR_ZERO_SEGMENT, "command contains zero length segment"),
+    ERROR_MESSAGE(ERR_UNDEFINED_COMMAND, "undefined command"),
+    ERROR_MESSAGE(ERR_OUT_OF_MEMORY, "out of memory"),
+    ERROR_MESSAGE(ERR_ARITY, "wrong number of arguments"),
+    ERROR_MESSAGE(ERR_RESPONSE_IS_TOO_LONG, "response is too long"),
+    ERROR_MESSAGE(ERR_TYPE_MISMATCH,
+        "trying to perform operation against key with wrong type"
+    ),
+    ERROR_MESSAGE(ERR_VALUE_IS_NOT_FLOAT, "value is not a float"),
+    ERROR_MESSAGE(ERR_VALUE_IS_NOT_INT, "value is not an integer")
+};
+
+static_assert(sizeof(error_messages) / sizeof(*error_messages) == ERR_MAX);
 
 typedef enum {
     REQ_OK,
@@ -98,7 +124,7 @@ static size_t utoa(size_t num, char *buf) {
     return size;
 }
 
-static bool write_to_output(Output *out, char *buf, size_t size) {
+static bool write_to_output(Output *out, const char *buf, size_t size) {
     size_t new_size = out->buf_size + size;
     if(new_size <= OUTPUT_BUF_SIZE) {
         memcpy(&out->buf[out->buf_size], buf, size);
@@ -128,7 +154,8 @@ static inline bool print_response(
     char *buf,
     Output *out
 ) {
-    char num_buf[32];
+    char num_buf[128];
+    size_t num_size;
     if(element_number) {
         size_t num_size = utoa(element_number, num_buf);
         num_buf[num_size++] = ')';
@@ -143,11 +170,25 @@ static inline bool print_response(
         res = write_to_output(out, "nil", 3);
         break;
     case RES_ERR:
+        uint32_t code;
+        memcpy(&code, &buf[RESPONSE_TYPE_LEN], INT_LEN);
+        code = ntohl(code);
+
+        const char *error_message;
+        size_t error_message_len;
+        if(code >= ERR_MAX) {
+            error_message = UNKNOWN_ERROR_CODE;
+            error_message_len = sizeof(UNKNOWN_ERROR_CODE) - 1;
+        } else {
+            error_message = error_messages[code].message;
+            error_message_len = error_messages[code].len;
+        }
+
         res = write_to_output(out, "ERR: ", 5);
         res &= write_to_output(
             out,
-            &buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN],
-            msg_len - RESPONSE_TYPE_LEN
+            error_message,
+            error_message_len
         );
         break;
     case RES_STR:
@@ -160,11 +201,21 @@ static inline bool print_response(
         res &= write_to_output(out, "\"", 1);
         break;
     case RES_INT:
-        uint32_t val;
-        memcpy(&val, &buf[RESPONSE_TYPE_LEN], INT_LEN);
-        val = ntohl(val);
-        size_t num_size = itoa((int32_t)val, num_buf);
+        uint32_t ival;
+        memcpy(&ival, &buf[RESPONSE_TYPE_LEN], INT_LEN);
+        ival = ntohl(ival);
+        num_size = itoa((int32_t)ival, num_buf);
         res = write_to_output(out, num_buf, num_size);
+        break;
+    case RES_DOUBLE:
+        double dval;
+        memcpy(&dval, &buf[RESPONSE_TYPE_LEN], DOUBLE_LEN);
+        dval = ntohd(dval);
+        num_size = snprintf(num_buf, sizeof(num_buf), "%lf", dval);
+        res = write_to_output(out, num_buf, num_size);
+        break;
+    case RES_ARR:
+        res = write_to_output(out, "(empty array)", 13);
         break;
     }
 
@@ -228,8 +279,11 @@ static bool read_and_print_response(
                 if(type == RES_NIL) {
                     msg_len = 0;
                     is_msg_len_set = true;
-                } else if(type == RES_INT) {
+                } else if(type == RES_INT || type == RES_ERR) {
                     msg_len = INT_LEN;
+                    is_msg_len_set = true;
+                } else if(type == RES_DOUBLE) {
+                    msg_len = DOUBLE_LEN;
                     is_msg_len_set = true;
                 } else if(buf_size >= RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN) {
                     uint32_t msg_len32;
@@ -242,10 +296,6 @@ static bool read_and_print_response(
 
                     if(type == RES_ARR) {
                         arr_size = msg_len32;
-                        if(arr_size == 0) {
-                            fputs(ZERO_SIZE_ARRAY_ERROR, stderr);
-                            return -1;
-                        }
                         arr_size++;
 
                         msg_len = INT_LEN; 
@@ -256,7 +306,7 @@ static bool read_and_print_response(
                 }
 
                 cur_len += RESPONSE_TYPE_LEN + msg_len;
-                if(buf_offset + cur_len > MAX_RESPONSE_LEN + MAX_ERROR_LEN) {
+                if(buf_offset + cur_len > MAX_RESPONSE_LEN + ERROR_RESPONSE_LEN) {
                     fputs(RESPONSE_IS_TOO_LONG_ERROR, stderr);
                     return false;
                 }
@@ -265,7 +315,7 @@ static bool read_and_print_response(
             if(buf_size >= cur_len) {
                 bool is_array = arr_size > 0;
 
-                if((!is_array || element_number > 0) &&
+                if((!is_array || element_number > 0 || arr_size == 1) &&
                    !print_response(type, msg_len, element_number, &buf[buf_offset], out))
                     return false;
 
@@ -396,7 +446,7 @@ int main(void) {
         goto exit;
     }
 
-    response_buf = malloc(MAX_RESPONSE_LEN + MAX_ERROR_LEN + 1);
+    response_buf = malloc(MAX_RESPONSE_LEN + ERROR_RESPONSE_LEN + 1);
     if(!response_buf) {
         perror("malloc");
         goto exit;

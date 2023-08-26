@@ -12,6 +12,7 @@
 #include "proto.h"
 #include "event.h"
 #include "hashtable.h"
+#include "object.h"
 
 typedef struct {
     int      fd;
@@ -41,6 +42,37 @@ extern State state;
 typedef void (*command_handler)(void);
 
 typedef struct {
-    unsigned int    arity;
+    unsigned int    min_args;
+    unsigned int    max_args;
     command_handler handler;
 } Command;
+
+typedef struct {
+    char     *saveptr;
+    char     bak;
+    uint32_t num_strings;
+} CmdArgState;
+
+#define INIT_CMD_ARG_STATE {NULL, 0, 0}
+
+char* next_cmd_arg(CmdArgState *arg_state);
+void cmd_restore(CmdArgState *arg_state);
+
+bool send_nil(void);
+bool send_str(const char *msg, uint32_t msg_len);
+bool send_int(int32_t val);
+bool send_double(double val);
+bool send_err(ErrorCode code);
+bool send_arr(void);
+void end_arr(uint32_t size);
+
+// key-value commands
+void get_handler(void);
+void set_handler(void);
+void del_handler(void);
+void keys_handler(void);
+
+// zset commands
+void zadd_handler(void);
+void zrange_handler(void);
+void zrem(void);

@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -12,34 +11,25 @@
 #include <sys/socket.h>
 #include "server.h"
 #include "hashtable.h"
+#include "util.h"
 
 #define RBUF_SIZE              MAX_COMMAND_LEN + 1
-#define WBUF_SIZE              MAX_RESPONSE_LEN + MAX_ERROR_LEN + 1
+#define WBUF_SIZE              MAX_RESPONSE_LEN + ERROR_RESPONSE_LEN + 1
 #define NUM_SUPPORTED_COMMANDS sizeof(commands) / sizeof(*commands)
-
-// errors
-#define ERROR_LEN(e)                sizeof(e) - 1
-#define RESPONSE_IS_TOO_LONG_ERROR "response is too long"
-#define COMMAND_IS_TOO_LONG_ERROR  "command is too long"
-#define ZERO_SEGMENT_ERROR         "command contains zero length segment"
-#define UNDEFINED_COMMAND_ERROR    "undefined command"
-#define OUT_OF_MEMORY_ERROR        "out of memory"
 
 State state;
 
-static void get_handler(void);
-static void set_handler(void);
-static void del_handler(void);
-static void keys_handler(void);
-
-struct {
+static struct {
     char    *name;
     Command command;
 } commands[] = {
-    { "GET",  { 1, get_handler } },
-    { "SET",  { 2, set_handler } },
-    { "DEL",  { 1, del_handler } },
-    { "KEYS", { 0, keys_handler } },
+    { "GET",    { .min_args = 1, .max_args = 1, .handler = get_handler    } },
+    { "SET",    { .min_args = 2, .max_args = 2, .handler = set_handler    } },
+    { "DEL",    { .min_args = 1, .max_args = 1, .handler = del_handler    } },
+    { "KEYS",   { .min_args = 0, .max_args = 0, .handler = keys_handler   } },
+    { "ZADD",   { .min_args = 3, .max_args = 3, .handler = zadd_handler   } },
+    { "ZRANGE", { .min_args = 3, .max_args = 6, .handler = zrange_handler } },
+    { "ZREM",   { .min_args = 2, .max_args = 2, .handler = zrem           } }
 };
 
 typedef enum {
@@ -48,11 +38,6 @@ typedef enum {
     ZeroSegment,
     CommandReadSuccess
 } PrepareResult;
-
-typedef enum {
-    UndefinedCommand,
-    OutOfMemory
-} ServerError;
 
 static inline PrepareResult prepare_command(size_t *_next_cmd_len) {
     Conn *conn = state.current_client;
@@ -139,23 +124,19 @@ static inline bool check_response_size_or_send_error(uint32_t response_len) {
         }
 
         char *buf = (char*)&conn->wbuf[conn->wbuf_size];
-        char *response = RESPONSE_IS_TOO_LONG_ERROR;
-        response_len = ERROR_LEN(RESPONSE_IS_TOO_LONG_ERROR);
-        conn->wbuf_size += RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN + response_len;
+        conn->wbuf_size += RESPONSE_TYPE_LEN + INT_LEN;
 
         uint32_t type = htonl(RES_ERR);
+        uint32_t code = htonl(ERR_RESPONSE_IS_TOO_LONG);
         memcpy(buf, &type, RESPONSE_TYPE_LEN);
-        memcpy(&buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN], response, response_len);
-        response_len = htonl(response_len);
-        memcpy(&buf[SIZE_SEGMENT_LEN], &response_len, SIZE_SEGMENT_LEN);
-
+        memcpy(&buf[RESPONSE_TYPE_LEN], &code, INT_LEN);
         conn->should_close = true;
         return false;
     }
     return true;
 }
 
-static inline bool send_nil(void) {
+bool send_nil(void) {
     if(!check_response_size_or_send_error(RESPONSE_TYPE_LEN))
         return false;
 
@@ -166,14 +147,14 @@ static inline bool send_nil(void) {
     return true;
 }
 
-static inline bool generic_send_str(uint32_t type, const char *msg, uint32_t msg_len) {
+bool send_str(const char *msg, uint32_t msg_len) {
     uint32_t response_size = RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN + msg_len;
     if(!check_response_size_or_send_error(response_size))
         return false;
 
     Conn *conn = state.current_client;
     char *buf = (char*)&conn->wbuf[conn->wbuf_size];
-    type = htonl(type);
+    uint32_t type = htonl(RES_STR);
     memcpy(buf, &type, RESPONSE_TYPE_LEN);
     memcpy(&buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN], msg, msg_len);
     msg_len = htonl(msg_len);
@@ -182,21 +163,13 @@ static inline bool generic_send_str(uint32_t type, const char *msg, uint32_t msg
     return true;
 }
 
-static inline bool send_err(char *msg, uint32_t msg_len) {
-    return generic_send_str(RES_ERR, msg, msg_len);
-}
-
-static inline bool send_str(char *msg, uint32_t msg_len) {
-    return generic_send_str(RES_STR, msg, msg_len);
-}
-
 static inline bool generic_send_int(uint32_t type, uint32_t val) {
     uint32_t response_size = RESPONSE_TYPE_LEN + INT_LEN;
     if(!check_response_size_or_send_error(response_size))
         return false;
 
     Conn *conn = state.current_client;
-    char *buf = (char*)&conn->wbuf[conn->wbuf_size];
+    uint8_t *buf = &conn->wbuf[conn->wbuf_size];
     type = htonl(type);
     val = htonl(val);
     memcpy(buf, &type, RESPONSE_TYPE_LEN);
@@ -205,108 +178,67 @@ static inline bool generic_send_int(uint32_t type, uint32_t val) {
     return true;
 }
 
-static inline bool send_int(int32_t val) {
+bool send_int(int32_t val) {
     return generic_send_int(RES_INT, val);
 }
 
-static inline bool send_arr(uint32_t size) {
-    Conn *conn = state.current_client;
-    size_t array_response_offset = conn->wbuf_size;
-    bool result = generic_send_int(RES_ARR, size);
-    if(result) {
-        conn->is_array_response = true;
-        conn->array_response_offset = array_response_offset;
-    }
-    return result;
+bool send_err(ErrorCode code) {
+    return generic_send_int(RES_ERR, code);
 }
 
-static inline void end_arr(void) {
-    Conn *conn = state.current_client;
-    conn->is_array_response = false;
-}
+bool send_double(double val) {
+    uint32_t response_size = RESPONSE_TYPE_LEN + DOUBLE_LEN;
+    if(!check_response_size_or_send_error(response_size))
+        return false;
 
- __attribute__ ((format (printf, 1, 2)))
-static inline void send_format_error(char *restrict fmt, ...) {
     Conn *conn = state.current_client;
     char *buf = (char*)&conn->wbuf[conn->wbuf_size];
-
-    va_list ap;
-    size_t wbuf_remain = MAX_RESPONSE_LEN - conn->wbuf_size -
-                         RESPONSE_TYPE_LEN - SIZE_SEGMENT_LEN;
-    va_start(ap, fmt);
-    int write_bytes = vsnprintf(
-        &buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN],
-        wbuf_remain,
-        fmt,
-        ap
-    );
-    va_end(ap);
-    size_t response_len;
-
-    if(write_bytes > wbuf_remain) {
-        response_len = ERROR_LEN(RESPONSE_IS_TOO_LONG_ERROR);
-        memcpy(
-            &buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN],
-            RESPONSE_IS_TOO_LONG_ERROR,
-            response_len
-        );
-        conn->should_close = true;
-    } else {
-        response_len = write_bytes;
-    }
-
-    size_t response_size = RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN + response_len;
-    conn->wbuf_size += response_size;
-
-    uint32_t type = htonl(RES_ERR);
+    uint32_t type = htonl(RES_DOUBLE);
+    val = htond(val);
     memcpy(buf, &type, RESPONSE_TYPE_LEN);
-    response_len = htonl(response_len);
-    memcpy(&buf[RESPONSE_TYPE_LEN], &response_len, SIZE_SEGMENT_LEN);
+    memcpy(&buf[RESPONSE_TYPE_LEN], &val, DOUBLE_LEN);
+    conn->wbuf_size += response_size;
+    return true;
+}
+
+bool send_arr(void) {
+    Conn *conn = state.current_client;
+    uint32_t response_size = RESPONSE_TYPE_LEN + INT_LEN;
+    if(!check_response_size_or_send_error(response_size))
+        return false;
+
+    conn->is_array_response = true;
+    conn->array_response_offset = conn->wbuf_size;
+    conn->wbuf_size += response_size;
+    return true;
+}
+
+void end_arr(uint32_t size) {
+    Conn *conn = state.current_client;
+    conn->is_array_response = false;
+    uint8_t *buf = &conn->wbuf[conn->array_response_offset];
+    uint32_t type = htonl(RES_ARR);
+    size = htonl(size);
+    memcpy(buf, &type, RESPONSE_TYPE_LEN);
+    memcpy(&buf[RESPONSE_TYPE_LEN], &size, SIZE_SEGMENT_LEN);
 }
 
 static inline void send_prepare_error(PrepareResult error) {
     Conn *conn = state.current_client;
-    char *response;
-    size_t response_len;
+    ErrorCode code;
     switch(error) {
     case CommandIsTooLong:
-        response = COMMAND_IS_TOO_LONG_ERROR;
-        response_len = ERROR_LEN(COMMAND_IS_TOO_LONG_ERROR);
+        code = ERR_COMMAND_IS_TOO_LONG;
         break;
     case ZeroSegment:
-        response = ZERO_SEGMENT_ERROR;
-        response_len = ERROR_LEN(ZERO_SEGMENT_ERROR);
+        code = ERR_ZERO_SEGMENT;
         break;
     default:
         return;
     }
 
-    send_err(response, response_len);
+    send_err(code);
     conn->should_close = true;
-}
-
-static inline void send_server_error(ServerError error) {
-    char *response;
-    size_t response_len;
-    switch(error) {
-    case UndefinedCommand:
-        response = UNDEFINED_COMMAND_ERROR;
-        response_len = ERROR_LEN(UNDEFINED_COMMAND_ERROR);
-        break;
-    case OutOfMemory:
-        response = OUT_OF_MEMORY_ERROR;
-        response_len = ERROR_LEN(OUT_OF_MEMORY_ERROR);
-        break;
-    }
-    send_err(response, response_len);
-}
-
-static inline void send_arity_error(unsigned int expected, unsigned int given) {
-    send_format_error(
-        "wrong number of arguments (given %u, expected %u)",
-        given,
-        expected
-    );
 }
 
 static inline void add_connection(void) {
@@ -399,26 +331,20 @@ static inline void handle_write_event(void) {
 
 static inline bool check_arity(Command *cmd) {
     Conn *conn = state.current_client;
-    if(conn->read_strings != cmd->arity + 1) {
-        send_arity_error(cmd->arity, conn->read_strings - 1);
+    if(conn->read_strings < cmd->min_args + 1 ||
+       conn->read_strings > cmd->max_args + 1)
+    {
+        send_err(ERR_ARITY);
         return false;
     }
     return true;
 }
 
-typedef struct {
-    char     *saveptr;
-    char     bak;
-    uint32_t num_strings;
-} CmdArgState;
-
-#define INIT_CMD_ARG_STATE {NULL, 0, 0}
-
-static inline void cmd_restore(CmdArgState *arg_state) {
+void cmd_restore(CmdArgState *arg_state) {
     *arg_state->saveptr = arg_state->bak;
 }
 
-static inline char* next_cmd_arg(CmdArgState *arg_state) {
+char* next_cmd_arg(CmdArgState *arg_state) {
     Conn *conn = state.current_client;
     if(!arg_state->saveptr) {
         uint32_t cmd_len;
@@ -445,79 +371,6 @@ static inline char* next_cmd_arg(CmdArgState *arg_state) {
     arg_state->saveptr += tok_len;
     arg_state->num_strings--;
     return tok;
-}
-
-static void get_handler(void) {
-    CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = next_cmd_arg(&arg_state);
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    if(!value_node) {
-        send_nil();
-    } else {
-        send_str(value_node->value, strlen(value_node->value));
-    }
-    next_cmd_arg(&arg_state);
-}
-
-static void set_handler(void) {
-    CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = NULL, *value = NULL;
-
-    key = strdup(next_cmd_arg(&arg_state));
-    if(!key)
-        goto out_of_memory;
-
-    value = strdup(next_cmd_arg(&arg_state));
-    if(!value)
-        goto out_of_memory;
-
-    if(!hash_table_set(state.keys, key, value))
-        goto out_of_memory;
-
-    next_cmd_arg(&arg_state);
-    send_nil();
-    return;
-
-out_of_memory:
-    if(key) free(key);
-    if(value) free(value);
-    cmd_restore(&arg_state);
-    send_server_error(OutOfMemory);
-}
-
-static void del_handler(void) {
-    CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = next_cmd_arg(&arg_state);
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    int32_t result;
-    if(value_node) {
-        hash_table_remove(state.keys, value_node);
-        result = 1;
-    } else {
-        result = 0;
-    }
-    next_cmd_arg(&arg_state);
-    send_int(result);
-}
-
-static void keys_handler(void) {
-    if(state.keys->size == 0) {
-        send_nil();
-        return;
-    }
-
-    if(!send_arr(state.keys->size))
-        return;
-
-    for(HashTableIterator it = hash_table_begin(state.keys);
-        hash_table_has_next(&it);
-        hash_table_next(&it))
-    {
-        if(!send_str(it.node->key, strlen(it.node->key)))
-            return;
-    }
-
-    end_arr();
 }
 
 static inline bool read_command(void) {
@@ -579,7 +432,7 @@ static inline void process_request(void) {
     cmd_name[cmd_name_len] = bak;
 
     if(!command_node) {
-        send_server_error(UndefinedCommand);
+        send_err(ERR_UNDEFINED_COMMAND);
     } else {
         Command *command = command_node->value;
         if(check_arity(command))
@@ -750,7 +603,7 @@ static inline bool init_server(void) {
     if(!set_event_mask(state.event_loop, state.accept_sock, EVENT_READ, false))
         return false;
 
-    state.keys = hash_table_new(free, free, INIT_KEYS_CAPACITY);
+    state.keys = hash_table_new(free, freeObject, INIT_KEYS_CAPACITY);
     if(!state.keys)
         return false;
 
