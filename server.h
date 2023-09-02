@@ -13,6 +13,7 @@
 #include "event.h"
 #include "hashtable.h"
 #include "object.h"
+#include "zset.h"
 
 typedef struct {
     int      fd;
@@ -79,10 +80,14 @@ void cmd_restore(CmdArgState *arg_state);
 bool send_nil(void);
 bool send_str(const char *msg, uint32_t msg_len);
 bool send_int(int32_t val);
+bool send_uint(uint32_t val);
 bool send_double(double val);
 bool send_err(ErrorCode code);
 bool send_arr(void);
 void end_arr(uint32_t size);
+
+bool get_string_by_key(const char *key, char **string);
+bool get_zset_by_key(const char *key, ZSet **zset);
 
 // key-value commands
 void get_handler(void);

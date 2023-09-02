@@ -9,16 +9,15 @@ void get_handler(void) {
     if(!next_string_arg(&arg_state, &key))
         return;
 
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    if(!value_node) {
+    char *value;
+    if(!get_string_by_key(key, &value))
+        goto end;
+
+    if(value)
+        send_str(value, strlen(value));
+    else
         send_nil();
-    } else {
-        Object *obj = value_node->value;
-        if(obj->type != OBJ_STRING)
-            send_err(ERR_TYPE_MISMATCH);
-        else
-            send_str(obj->ptr, strlen(obj->ptr));
-    }
+end:
     cmd_restore(&arg_state);
 }
 
@@ -73,7 +72,7 @@ void del_handler(void) {
     if(!next_string_arg(&arg_state, &key))
         return;
     HashTableNode *value_node = hash_table_get(state.keys, key);
-    int32_t result;
+    uint32_t result;
     if(value_node) {
         hash_table_remove(state.keys, value_node);
         result = 1;
@@ -81,7 +80,7 @@ void del_handler(void) {
         result = 0;
     }
     cmd_restore(&arg_state);
-    send_int(result);
+    send_uint(result);
 }
 
 // KEYS

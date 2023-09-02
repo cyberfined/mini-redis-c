@@ -267,6 +267,7 @@ ZSet* zset_new(hash_table_key_free_func value_free_func) {
     ZSet *zset = calloc(1, sizeof(ZSet));
     if(!zset) {
         perror("zset_new (calloc)");
+        goto error;
     }
 
     zset->tree = avl_new();
@@ -280,7 +281,7 @@ ZSet* zset_new(hash_table_key_free_func value_free_func) {
     return zset;
 error:
     if(zset) {
-        if(zset->tree) free(zset);
+        if(zset->tree) avl_free(zset->tree);
         free(zset);
     }
     return NULL;
@@ -301,6 +302,8 @@ AvlNode* zset_add(ZSet *zset, double score, char *value) {
     }
 
     if(h_node->value != NULL) {
+        if(zset->htable->key_free_func)
+            zset->htable->key_free_func(value);
         avl_remove(zset->tree, h_node->value);
     }
 
@@ -407,19 +410,22 @@ void zset_remove(ZSet *zset, AvlNode *node) {
 // ZADD key score member
 void zadd_handler(void) {
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    ErrorCode error_code = ERR_OUT_OF_MEMORY;
-    HashTableNode *value_node = NULL;
     char *key = NULL, *member = NULL;
     ZSet *zset = NULL;
     bool should_send_error = true;
+    bool zset_exists = false;
 
     if(!next_string_arg(&arg_state, &key)) {
         should_send_error = false;
         goto error;
     }
 
-    value_node = hash_table_get(state.keys, key);
-    if(!value_node) {
+    if(!get_zset_by_key(key, &zset)) {
+        should_send_error = false;
+        goto error;
+    }
+
+    if(!zset) {
         key = strdup(key);
         if(!key)
             goto error;
@@ -428,12 +434,7 @@ void zadd_handler(void) {
         if(!zset)
             goto error;
     } else {
-        Object *value_obj = value_node->value;
-        if(value_obj->type != OBJ_ZSET) {
-            error_code = ERR_TYPE_MISMATCH;
-            goto error;
-        }
-        zset = value_obj->ptr;
+        zset_exists = true;
     }
 
     double score;
@@ -456,7 +457,7 @@ void zadd_handler(void) {
         goto error;
     }
 
-    if(!value_node) {
+    if(!zset_exists) {
         Object *value_obj = createZSetObject(zset);
         if(!value_obj)
             goto error;
@@ -471,16 +472,17 @@ void zadd_handler(void) {
     return;
 
 error:
-    if(!value_node) {
-        if(key) free(key);
-        if(zset)
+    if(!zset_exists) {
+        if(zset) {
+            if(key) free(key);
             zset_free(zset);
+        }
         else if(member)
             free(member);
     }
     cmd_restore(&arg_state);
     if(should_send_error)
-        send_err(error_code);
+        send_err(ERR_OUT_OF_MEMORY);
 }
 
 typedef struct {
@@ -556,22 +558,16 @@ void zrange_handler(void) {
     Conn *conn = state.current_client;
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
     char *key = NULL;
-    ZSet *zset;
+    ZSet *zset = NULL;
     bool with_scores = false;
-
 
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    if(value_node) {
-        Object *obj_value = value_node->value;
-        if(obj_value->type != OBJ_ZSET) {
-            send_err(ERR_TYPE_MISMATCH);
-            goto end;
-        }
-        zset = obj_value->ptr;
-    } else {
+    if(!get_zset_by_key(key, &zset))
+        goto end;
+
+    if(!zset) {
         if(!send_arr())
             goto end;
         end_arr(0);
@@ -643,23 +639,19 @@ end:
 // ZREM key member
 void zrem_handler(void) {
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
+    ZSet *zset = NULL;
+    uint32_t result;
     char *key, *member;
 
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    int32_t result;
-    if(!value_node) {
+    if(!get_zset_by_key(key, &zset))
+        goto end;
+
+    if(!zset) {
         result = 0;
     } else {
-        Object *obj_value = value_node->value;
-        if(obj_value->type != OBJ_ZSET) {
-            send_err(ERR_TYPE_MISMATCH);
-            goto end;
-        }
-
-        ZSet *zset = obj_value->ptr;
         if(!next_string_arg(&arg_state, &member))
             goto end;
         AvlNode *a_node = zset_find(zset, member);
@@ -671,7 +663,7 @@ void zrem_handler(void) {
         }
     }
 
-    send_int(result);
+    send_uint(result);
 end:
     cmd_restore(&arg_state);
 }
@@ -680,25 +672,22 @@ end:
 void zcard_handler(void) {
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
     char *key;
+    ZSet *zset = NULL;
+    uint32_t result;
 
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    int32_t result;
-    if(!value_node) {
+    if(!get_zset_by_key(key, &zset))
+        goto end;
+
+    if(!zset) {
         result = 0;
     } else {
-        Object *obj_value = value_node->value;
-        if(obj_value->type != OBJ_ZSET) {
-            send_err(ERR_TYPE_MISMATCH);
-            goto end;
-        }
-        ZSet *zset = obj_value->ptr;
         result = zset->tree->size;
     }
 
-    send_int(result);
+    send_uint(result);
 end:
     cmd_restore(&arg_state);
 }
@@ -707,26 +696,22 @@ end:
 void zscore_handler(void) {
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
     char *key, *member;
+    ZSet *zset = NULL;
 
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    if(!value_node) {
-        send_nil();
+    if(!get_zset_by_key(key, &zset))
         goto end;
-    }
 
-    Object *obj_value = value_node->value;
-    if(obj_value->type != OBJ_ZSET) {
-        send_err(ERR_TYPE_MISMATCH);
+    if(!zset) {
+        send_nil();
         goto end;
     }
 
     if(!next_string_arg(&arg_state, &member))
         goto end;
 
-    ZSet *zset = obj_value->ptr;
     AvlNode *a_node = zset_find(zset, member);
     if(!a_node)
         send_nil();

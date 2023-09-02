@@ -23,6 +23,7 @@ typedef enum {
     RES_ERR,
     RES_STR,
     RES_INT,
+    RES_UINT,
     RES_DOUBLE,
     RES_ARR,
     RES_MAX

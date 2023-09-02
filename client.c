@@ -322,10 +322,14 @@ static inline bool print_response(
         res &= write_to_output(out, "\"", 1);
         break;
     case RES_INT:
+    case RES_UINT:
         uint32_t ival;
         memcpy(&ival, &buf[RESPONSE_TYPE_LEN], INT_LEN);
         ival = ntohl(ival);
-        num_size = itoa((int32_t)ival, num_buf);
+        if(type == RES_INT)
+            num_size = itoa((int32_t)ival, num_buf);
+        else
+            num_size = utoa(ival, num_buf);
         res = write_to_output(out, num_buf, num_size);
         break;
     case RES_DOUBLE:
@@ -399,7 +403,7 @@ static bool read_and_print_response(
                 if(type == RES_NIL) {
                     msg_len = 0;
                     is_msg_len_set = true;
-                } else if(type == RES_INT || type == RES_ERR) {
+                } else if(type == RES_INT || type == RES_UINT || type == RES_ERR) {
                     msg_len = INT_LEN;
                     is_msg_len_set = true;
                 } else if(type == RES_DOUBLE) {

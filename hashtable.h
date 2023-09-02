@@ -42,6 +42,6 @@ static inline bool hash_table_has_next(HashTableIterator *it) {
     return it->node != NULL;
 }
 void hash_table_next(HashTableIterator *it);
-HashTableNode* hash_table_get(HashTable *htable, char *key);
+HashTableNode* hash_table_get(HashTable *htable, const char *key);
 HashTableNode* hash_table_set(HashTable *htable, char *key, void *value);
 void hash_table_remove(HashTable *htable, HashTableNode *node);

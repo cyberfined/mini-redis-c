@@ -132,7 +132,7 @@ static uint32_t jenkins_hash(const void *_key, size_t length) {
     return hash;
 }
 
-HashTableNode* hash_table_get(HashTable *htable, char *key) {
+HashTableNode* hash_table_get(HashTable *htable, const char *key) {
     if(htable->size == 0)
         return NULL;
     
@@ -177,7 +177,7 @@ static void rehash(HashTable *htable, int next_capacity_index) {
         next_capacity = capacities[next_capacity_index];
         HashTableNode **new_buckets = realloc(
             htable->buckets,
-            next_capacity * sizeof(HashTableNode**)
+            next_capacity * sizeof(HashTableNode*)
         );
         if(!new_buckets) {
             perror("hash_table_rehash (realloc)");

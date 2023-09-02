@@ -213,6 +213,10 @@ bool send_int(int32_t val) {
     return generic_send_int(RES_INT, val);
 }
 
+bool send_uint(uint32_t val) {
+    return generic_send_int(RES_UINT, val);
+}
+
 bool send_err(ErrorCode code) {
     return generic_send_int(RES_ERR, code);
 }
@@ -250,6 +254,31 @@ void end_arr(uint32_t size) {
     size = htonl(size);
     *buf = RES_ARR;
     memcpy(&buf[RESPONSE_TYPE_LEN], &size, SIZE_SEGMENT_LEN);
+}
+
+static inline bool assert_type_get(ObjectType type, const char *key, void **value) {
+    HashTableNode *node = hash_table_get(state.keys, key);
+    if(!node) {
+        *value = NULL;
+        return true;
+    }
+
+    Object *obj = node->value;
+    if(obj->type != type) {
+        send_err(ERR_TYPE_MISMATCH);
+        return false;
+    }
+
+    *value = obj->ptr;
+    return true;
+}
+
+bool get_string_by_key(const char *key, char **string) {
+    return assert_type_get(OBJ_STRING, key, (void**)string);
+}
+
+bool get_zset_by_key(const char *key, ZSet **zset) {
+    return assert_type_get(OBJ_ZSET, key, (void**)zset);
 }
 
 static inline void send_command_error(CommandCheckResult error) {
