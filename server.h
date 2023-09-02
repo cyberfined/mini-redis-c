@@ -17,7 +17,7 @@
 typedef struct {
     int      fd;
     size_t   rbuf_offset, cmd_len, rbuf_size;
-    uint32_t read_strings;
+    uint32_t read_tokens;
     uint8_t  *rbuf;
     uint8_t  *wbuf;
     size_t   wbuf_offset, wbuf_size;
@@ -47,15 +47,33 @@ typedef struct {
     command_handler handler;
 } Command;
 
+typedef enum {
+    ARG_INT,
+    ARG_DOUBLE,
+    ARG_STRING
+} ArgType;
+
 typedef struct {
-    char     *saveptr;
-    char     bak;
-    uint32_t num_strings;
+    ArgType type;
+    union {
+        uint32_t int_arg;
+        double   double_arg;
+        char     *str_arg;
+    };
+} Arg;
+
+typedef struct {
+    uint8_t  *saveptr;
+    uint8_t  bak;
+    uint32_t num_tokens;
 } CmdArgState;
 
 #define INIT_CMD_ARG_STATE {NULL, 0, 0}
 
-char* next_cmd_arg(CmdArgState *arg_state);
+bool next_cmd_arg(CmdArgState *arg_state, Arg *arg);
+bool next_int_arg(CmdArgState *arg_state, uint32_t *arg);
+bool next_double_arg(CmdArgState *arg_state, double *arg);
+bool next_string_arg(CmdArgState *arg_state, char **arg);
 void cmd_restore(CmdArgState *arg_state);
 
 bool send_nil(void);
@@ -75,4 +93,6 @@ void keys_handler(void);
 // zset commands
 void zadd_handler(void);
 void zrange_handler(void);
-void zrem(void);
+void zrem_handler(void);
+void zcard_handler(void);
+void zscore_handler(void);

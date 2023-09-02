@@ -1,39 +1,8 @@
 #include <stdlib.h>
 #include <stdint.h>
-#include <inttypes.h>
 #include <string.h>
-#include <errno.h>
-#include <math.h>
-#include <ctype.h>
 
 #include "util.h"
-
-bool string2d(const char *str, double *d) {
-    char *endpptr;
-    size_t len = strlen(str);
-    *d = strtod(str, &endpptr);
-    if(isspace(str[0]) ||
-       (endpptr - str) != len ||
-       (errno == ERANGE &&
-        (*d == HUGE_VAL || *d == -HUGE_VAL || fpclassify(*d) == FP_ZERO)))
-    {
-        return false;
-    }
-    return true;
-}
-
-bool string2umax(const char *str, uintmax_t *i) {
-    char *endpptr;
-    size_t len = strlen(str);
-    *i = strtoumax(str, &endpptr, 10);
-    if(isspace(str[0]) ||
-       (endpptr - str) != len ||
-       (errno == ERANGE && *i == UINTMAX_MAX))
-    {
-        return false;
-    }
-    return true;
-}
 
 #ifdef LITTLE_ENDIAN_FLOAT
 double htond(double hostdouble) {

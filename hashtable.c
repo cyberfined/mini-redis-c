@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "server.h"
 
 #define NUM_CAPACITIES 29
 size_t capacities[NUM_CAPACITIES] = {
@@ -286,86 +285,4 @@ void hash_table_remove(HashTable *htable, HashTableNode *node) {
     {
         rehash(htable, htable->capacity_index - 1);
     }
-}
-
-// GET key
-void get_handler(void) {
-    CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = next_cmd_arg(&arg_state);
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    if(!value_node) {
-        send_nil();
-    } else {
-        Object *obj = value_node->value;
-        if(obj->type != OBJ_STRING)
-            send_err(ERR_TYPE_MISMATCH);
-        else
-            send_str(obj->ptr, strlen(obj->ptr));
-    }
-    cmd_restore(&arg_state);
-}
-
-// SET key value
-void set_handler(void) {
-    CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = NULL, *value = NULL;
-    Object *value_obj = NULL;
-
-    key = strdup(next_cmd_arg(&arg_state));
-    if(!key)
-        goto out_of_memory;
-
-    value = strdup(next_cmd_arg(&arg_state));
-    if(!value)
-        goto out_of_memory;
-
-    value_obj = createStringObject(value);
-    if(!value_obj)
-        goto out_of_memory;
-
-    if(!hash_table_set(state.keys, key, value_obj))
-        goto out_of_memory;
-
-    cmd_restore(&arg_state);
-    send_nil();
-    return;
-
-out_of_memory:
-    if(key) free(key);
-    if(value) free(value);
-    if(value_obj) free(value_obj);
-    cmd_restore(&arg_state);
-    send_err(ERR_OUT_OF_MEMORY);
-}
-
-// DEL key
-void del_handler(void) {
-    CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = next_cmd_arg(&arg_state);
-    HashTableNode *value_node = hash_table_get(state.keys, key);
-    int32_t result;
-    if(value_node) {
-        hash_table_remove(state.keys, value_node);
-        result = 1;
-    } else {
-        result = 0;
-    }
-    cmd_restore(&arg_state);
-    send_int(result);
-}
-
-// KEYS
-void keys_handler(void) {
-    if(!send_arr())
-        return;
-
-    for(HashTableIterator it = hash_table_begin(state.keys);
-        hash_table_has_next(&it);
-        hash_table_next(&it))
-    {
-        if(!send_str(it.node->key, strlen(it.node->key)))
-            return;
-    }
-
-    end_arr(state.keys->size);
 }

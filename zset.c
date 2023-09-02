@@ -411,8 +411,13 @@ void zadd_handler(void) {
     HashTableNode *value_node = NULL;
     char *key = NULL, *member = NULL;
     ZSet *zset = NULL;
+    bool should_send_error = true;
 
-    key = next_cmd_arg(&arg_state);
+    if(!next_string_arg(&arg_state, &key)) {
+        should_send_error = false;
+        goto error;
+    }
+
     value_node = hash_table_get(state.keys, key);
     if(!value_node) {
         key = strdup(key);
@@ -432,12 +437,16 @@ void zadd_handler(void) {
     }
 
     double score;
-    if(!string2d(next_cmd_arg(&arg_state), &score)) {
-        error_code = ERR_VALUE_IS_NOT_FLOAT;
+    if(!next_double_arg(&arg_state, &score)) {
+        should_send_error = false;
         goto error;
     }
 
-    member = strdup(next_cmd_arg(&arg_state));
+    if(!next_string_arg(&arg_state, &member)) {
+        should_send_error = false;
+        goto error;
+    }
+    member = strdup(member);
     if(!member)
         goto error;
 
@@ -470,7 +479,8 @@ error:
             free(member);
     }
     cmd_restore(&arg_state);
-    send_err(error_code);
+    if(should_send_error)
+        send_err(error_code);
 }
 
 typedef struct {
@@ -545,17 +555,21 @@ static bool zrange_iter_count_with_scores(AvlNode *a_node, void *arg) {
 void zrange_handler(void) {
     Conn *conn = state.current_client;
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = next_cmd_arg(&arg_state);
-    HashTableNode *value_node = hash_table_get(state.keys, key);
+    char *key = NULL;
     ZSet *zset;
     bool with_scores = false;
+
+
+    if(!next_string_arg(&arg_state, &key))
+        goto end;
+
+    HashTableNode *value_node = hash_table_get(state.keys, key);
     if(value_node) {
         Object *obj_value = value_node->value;
         if(obj_value->type != OBJ_ZSET) {
             send_err(ERR_TYPE_MISMATCH);
             goto end;
         }
-
         zset = obj_value->ptr;
     } else {
         if(!send_arr())
@@ -565,43 +579,42 @@ void zrange_handler(void) {
     }
 
     double start, end;
-    if(!string2d(next_cmd_arg(&arg_state), &start)) {
-        send_err(ERR_VALUE_IS_NOT_FLOAT);
+    if(!next_double_arg(&arg_state, &start))
         goto end;
-    }
-
-    if(!string2d(next_cmd_arg(&arg_state), &end)) {
-        send_err(ERR_VALUE_IS_NOT_FLOAT);
+    if(!next_double_arg(&arg_state, &end))
         goto end;
-    }
 
-    uintmax_t offset = 0;
+    uint32_t offset = 0;
     zset_iter_func iter_func;
     RangeIter iter = (RangeIter) { .count = 0, .max_count = 0, .is_error = false };
-    if(conn->read_strings == 5) {
-        if(strcmp(next_cmd_arg(&arg_state), "WITHSCORES") != 0) {
+    if(conn->read_tokens == 5) {
+        char *with_str;
+        if(!next_string_arg(&arg_state, &with_str))
+            goto end;
+        if(strcmp(with_str, "WITHSCORES") != 0) {
             send_err(ERR_ARITY);
             goto end;
         }
+
         with_scores = true;
         iter_func = zrange_iter_with_scores;
-    } else if(conn->read_strings > 5) {
-        if(!string2umax(next_cmd_arg(&arg_state), &offset)) {
-            send_err(ERR_VALUE_IS_NOT_INT);
+    } else if(conn->read_tokens > 5) {
+        if(!next_int_arg(&arg_state, &offset))
             goto end;
-        }
 
-        uintmax_t max_count;
-        if(!string2umax(next_cmd_arg(&arg_state), &max_count)) {
-            send_err(ERR_VALUE_IS_NOT_INT);
+        uint32_t max_count;
+        if(!next_int_arg(&arg_state, &max_count))
             goto end;
-        }
+
         iter.max_count = max_count;
 
-        if(conn->read_strings == 6) {
+        if(conn->read_tokens == 6) {
             iter_func = zrange_iter_count;
         } else {
-            if(strcmp(next_cmd_arg(&arg_state), "WITHSCORES") != 0) {
+            char *with_str;
+            if(!next_string_arg(&arg_state, &with_str))
+                goto end;
+            if(strcmp(with_str, "WITHSCORES") != 0) {
                 send_err(ERR_ARITY);
                 goto end;
             }
@@ -628,9 +641,13 @@ end:
 }
 
 // ZREM key member
-void zrem(void) {
+void zrem_handler(void) {
     CmdArgState arg_state = INIT_CMD_ARG_STATE;
-    char *key = next_cmd_arg(&arg_state);
+    char *key, *member;
+
+    if(!next_string_arg(&arg_state, &key))
+        goto end;
+
     HashTableNode *value_node = hash_table_get(state.keys, key);
     int32_t result;
     if(!value_node) {
@@ -643,8 +660,9 @@ void zrem(void) {
         }
 
         ZSet *zset = obj_value->ptr;
-        char *value = next_cmd_arg(&arg_state);
-        AvlNode *a_node = zset_find(zset, value);
+        if(!next_string_arg(&arg_state, &member))
+            goto end;
+        AvlNode *a_node = zset_find(zset, member);
         if(!a_node) {
             result = 0;
         } else {
@@ -654,6 +672,66 @@ void zrem(void) {
     }
 
     send_int(result);
+end:
+    cmd_restore(&arg_state);
+}
+
+// ZCARD key
+void zcard_handler(void) {
+    CmdArgState arg_state = INIT_CMD_ARG_STATE;
+    char *key;
+
+    if(!next_string_arg(&arg_state, &key))
+        goto end;
+
+    HashTableNode *value_node = hash_table_get(state.keys, key);
+    int32_t result;
+    if(!value_node) {
+        result = 0;
+    } else {
+        Object *obj_value = value_node->value;
+        if(obj_value->type != OBJ_ZSET) {
+            send_err(ERR_TYPE_MISMATCH);
+            goto end;
+        }
+        ZSet *zset = obj_value->ptr;
+        result = zset->tree->size;
+    }
+
+    send_int(result);
+end:
+    cmd_restore(&arg_state);
+}
+
+// ZSCORE key member
+void zscore_handler(void) {
+    CmdArgState arg_state = INIT_CMD_ARG_STATE;
+    char *key, *member;
+
+    if(!next_string_arg(&arg_state, &key))
+        goto end;
+
+    HashTableNode *value_node = hash_table_get(state.keys, key);
+    if(!value_node) {
+        send_nil();
+        goto end;
+    }
+
+    Object *obj_value = value_node->value;
+    if(obj_value->type != OBJ_ZSET) {
+        send_err(ERR_TYPE_MISMATCH);
+        goto end;
+    }
+
+    if(!next_string_arg(&arg_state, &member))
+        goto end;
+
+    ZSet *zset = obj_value->ptr;
+    AvlNode *a_node = zset_find(zset, member);
+    if(!a_node)
+        send_nil();
+    else
+        send_double(a_node->key);
 end:
     cmd_restore(&arg_state);
 }

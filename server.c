@@ -16,6 +16,7 @@
 #define RBUF_SIZE              MAX_COMMAND_LEN + 1
 #define WBUF_SIZE              MAX_RESPONSE_LEN + ERROR_RESPONSE_LEN + 1
 #define NUM_SUPPORTED_COMMANDS sizeof(commands) / sizeof(*commands)
+#define MIN_TOKEN_SIZE         REQUEST_TYPE_LEN + INT_LEN
 
 State state;
 
@@ -29,59 +30,93 @@ static struct {
     { "KEYS",   { .min_args = 0, .max_args = 0, .handler = keys_handler   } },
     { "ZADD",   { .min_args = 3, .max_args = 3, .handler = zadd_handler   } },
     { "ZRANGE", { .min_args = 3, .max_args = 6, .handler = zrange_handler } },
-    { "ZREM",   { .min_args = 2, .max_args = 2, .handler = zrem           } }
+    { "ZREM",   { .min_args = 2, .max_args = 2, .handler = zrem_handler   } },
+    { "ZCARD",  { .min_args = 1, .max_args = 1, .handler = zcard_handler  } },
+    { "ZSCORE", { .min_args = 2, .max_args = 2, .handler = zscore_handler } }
 };
 
 typedef enum {
     CommandPartiallyRead,
     CommandIsTooLong,
+    UnknownTokenType,
     ZeroSegment,
+    CommandNameIsNotString,
     CommandReadSuccess
-} PrepareResult;
+} CommandCheckResult;
 
-static inline PrepareResult prepare_command(size_t *_next_cmd_len) {
+static inline CommandCheckResult check_command_was_read(size_t *_next_cmd_len) {
     Conn *conn = state.current_client;
 
-    if(conn->rbuf_size < 2 * SIZE_SEGMENT_LEN) {
-        *_next_cmd_len = 2 * SIZE_SEGMENT_LEN + 1;
+    size_t next_cmd_len = SIZE_SEGMENT_LEN + REQUEST_TYPE_LEN + SIZE_SEGMENT_LEN + 1;
+    if(conn->rbuf_size < next_cmd_len) {
+        // First time.
+        // Command header is NUM_TOKENS + REQUEST_TYPE + STRING_LENGTH + char
+        *_next_cmd_len = next_cmd_len;
         return CommandPartiallyRead;
     }
 
-    uint32_t num_strings;
-    memcpy(&num_strings, &conn->rbuf[conn->rbuf_offset], SIZE_SEGMENT_LEN);
+    uint32_t num_tokens;
+    bool is_first_token;
+    memcpy(&num_tokens, &conn->rbuf[conn->rbuf_offset], SIZE_SEGMENT_LEN);
     if(conn->cmd_len == 0) {
-        num_strings = ntohl(num_strings);
-        memcpy(&conn->rbuf[conn->rbuf_offset], &num_strings, SIZE_SEGMENT_LEN);
+        num_tokens = ntohl(num_tokens);
+        memcpy(&conn->rbuf[conn->rbuf_offset], &num_tokens, SIZE_SEGMENT_LEN);
         conn->cmd_len = SIZE_SEGMENT_LEN;
-        conn->read_strings = 0;
+        conn->read_tokens = 0;
+        is_first_token = true;
+    } else {
+        is_first_token = false;
     }
 
-    if(num_strings == 0)
+    if(num_tokens == 0)
         return ZeroSegment;
 
-    while(conn->cmd_len < conn->rbuf_size && conn->read_strings < num_strings) {
+    while(conn->cmd_len + MIN_TOKEN_SIZE <= conn->rbuf_size &&
+          conn->read_tokens < num_tokens)
+    {
         size_t cur = conn->rbuf_offset + conn->cmd_len;
-        uint32_t str_len;
-        memcpy(&str_len, &conn->rbuf[cur], SIZE_SEGMENT_LEN);
-        str_len = ntohl(str_len);
-        if(str_len == 0)
-            return ZeroSegment;
+        uint8_t token_type = conn->rbuf[cur];
 
-        size_t segment_len = str_len + SIZE_SEGMENT_LEN;
-        size_t next_cmd_len = conn->cmd_len + segment_len;
+        uint32_t str_len, token_len;
+        switch(token_type) {
+        case REQ_INT:
+            token_len = INT_LEN;
+            break;
+        case REQ_DOUBLE:
+            token_len = DOUBLE_LEN;
+            break;
+        case REQ_STR:
+            memcpy(&str_len, &conn->rbuf[cur + REQUEST_TYPE_LEN], SIZE_SEGMENT_LEN);
+            str_len = ntohl(str_len);
+            if(str_len == 0)
+                return ZeroSegment;
+            token_len = str_len + SIZE_SEGMENT_LEN;
+            break;
+        default:
+            return UnknownTokenType;
+        }
+        token_len += REQUEST_TYPE_LEN;
+
+        if(is_first_token) {
+            if(token_type != REQ_STR)
+                return CommandNameIsNotString;
+            is_first_token = false;
+        }
+
+        next_cmd_len = conn->cmd_len + token_len;
         if(next_cmd_len > MAX_COMMAND_LEN) {
             return CommandIsTooLong;
         } else if(next_cmd_len > conn->rbuf_size) {
             *_next_cmd_len = next_cmd_len;
             return CommandPartiallyRead;
         }
-        memcpy(&conn->rbuf[cur], &str_len, SIZE_SEGMENT_LEN);
+
         conn->cmd_len = next_cmd_len;
-        conn->read_strings++;
+        conn->read_tokens++;
     }
 
-    if(conn->read_strings != num_strings) {
-        size_t next_cmd_len = conn->cmd_len + SIZE_SEGMENT_LEN + 1;
+    if(conn->read_tokens != num_tokens) {
+        next_cmd_len = conn->cmd_len + MIN_TOKEN_SIZE;
         if(next_cmd_len > MAX_COMMAND_LEN)
             return CommandIsTooLong;
 
@@ -140,10 +175,8 @@ bool send_nil(void) {
     if(!check_response_size_or_send_error(RESPONSE_TYPE_LEN))
         return false;
 
-    uint32_t type = htonl(RES_NIL);
     Conn *conn = state.current_client;
-    memcpy(&conn->wbuf[conn->wbuf_size], &type, RESPONSE_TYPE_LEN);
-    conn->wbuf_size += RESPONSE_TYPE_LEN;
+    conn->wbuf[conn->wbuf_size++] = RES_NIL;
     return true;
 }
 
@@ -153,9 +186,8 @@ bool send_str(const char *msg, uint32_t msg_len) {
         return false;
 
     Conn *conn = state.current_client;
-    char *buf = (char*)&conn->wbuf[conn->wbuf_size];
-    uint32_t type = htonl(RES_STR);
-    memcpy(buf, &type, RESPONSE_TYPE_LEN);
+    uint8_t *buf = &conn->wbuf[conn->wbuf_size];
+    *buf = RES_STR;
     memcpy(&buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN], msg, msg_len);
     msg_len = htonl(msg_len);
     memcpy(&buf[RESPONSE_TYPE_LEN], &msg_len, SIZE_SEGMENT_LEN);
@@ -163,16 +195,15 @@ bool send_str(const char *msg, uint32_t msg_len) {
     return true;
 }
 
-static inline bool generic_send_int(uint32_t type, uint32_t val) {
+static inline bool generic_send_int(uint8_t type, uint32_t val) {
     uint32_t response_size = RESPONSE_TYPE_LEN + INT_LEN;
     if(!check_response_size_or_send_error(response_size))
         return false;
 
     Conn *conn = state.current_client;
     uint8_t *buf = &conn->wbuf[conn->wbuf_size];
-    type = htonl(type);
     val = htonl(val);
-    memcpy(buf, &type, RESPONSE_TYPE_LEN);
+    *buf = type;
     memcpy(&buf[RESPONSE_TYPE_LEN], &val, INT_LEN);
     conn->wbuf_size += response_size;
     return true;
@@ -192,10 +223,9 @@ bool send_double(double val) {
         return false;
 
     Conn *conn = state.current_client;
-    char *buf = (char*)&conn->wbuf[conn->wbuf_size];
-    uint32_t type = htonl(RES_DOUBLE);
+    uint8_t *buf = &conn->wbuf[conn->wbuf_size];
     val = htond(val);
-    memcpy(buf, &type, RESPONSE_TYPE_LEN);
+    *buf = RES_DOUBLE;
     memcpy(&buf[RESPONSE_TYPE_LEN], &val, DOUBLE_LEN);
     conn->wbuf_size += response_size;
     return true;
@@ -217,21 +247,26 @@ void end_arr(uint32_t size) {
     Conn *conn = state.current_client;
     conn->is_array_response = false;
     uint8_t *buf = &conn->wbuf[conn->array_response_offset];
-    uint32_t type = htonl(RES_ARR);
     size = htonl(size);
-    memcpy(buf, &type, RESPONSE_TYPE_LEN);
+    *buf = RES_ARR;
     memcpy(&buf[RESPONSE_TYPE_LEN], &size, SIZE_SEGMENT_LEN);
 }
 
-static inline void send_prepare_error(PrepareResult error) {
+static inline void send_command_error(CommandCheckResult error) {
     Conn *conn = state.current_client;
     ErrorCode code;
     switch(error) {
     case CommandIsTooLong:
         code = ERR_COMMAND_IS_TOO_LONG;
         break;
+    case UnknownTokenType:
+        code = ERR_UNKNOWN_TOKEN_TYPE;
+        break;
     case ZeroSegment:
         code = ERR_ZERO_SEGMENT;
+        break;
+    case CommandNameIsNotString:
+        code = ERR_COMMAND_NAME_IS_NOT_STRING;
         break;
     default:
         return;
@@ -262,7 +297,7 @@ static inline void add_connection(void) {
         conn->rbuf_offset = 0;
         conn->cmd_len = 0;
         conn->rbuf_size = 0;
-        conn->read_strings = 0;
+        conn->read_tokens = 0;
         conn->wbuf_offset = 0;
         conn->wbuf_size = 0;
         conn->is_array_response = false;
@@ -331,8 +366,8 @@ static inline void handle_write_event(void) {
 
 static inline bool check_arity(Command *cmd) {
     Conn *conn = state.current_client;
-    if(conn->read_strings < cmd->min_args + 1 ||
-       conn->read_strings > cmd->max_args + 1)
+    if(conn->read_tokens < cmd->min_args + 1 ||
+       conn->read_tokens > cmd->max_args + 1)
     {
         send_err(ERR_ARITY);
         return false;
@@ -340,37 +375,96 @@ static inline bool check_arity(Command *cmd) {
     return true;
 }
 
-void cmd_restore(CmdArgState *arg_state) {
-    *arg_state->saveptr = arg_state->bak;
-}
-
-char* next_cmd_arg(CmdArgState *arg_state) {
+bool next_cmd_arg(CmdArgState *arg_state, Arg *arg) {
     Conn *conn = state.current_client;
     if(!arg_state->saveptr) {
         uint32_t cmd_len;
         memcpy(
             &cmd_len,
-            &conn->rbuf[conn->rbuf_offset + SIZE_SEGMENT_LEN],
+            &conn->rbuf[conn->rbuf_offset + SIZE_SEGMENT_LEN + REQUEST_TYPE_LEN],
             SIZE_SEGMENT_LEN
         );
-        size_t arg_offset = conn->rbuf_offset + 2 * SIZE_SEGMENT_LEN + cmd_len;
-        arg_state->saveptr = (char*)&conn->rbuf[arg_offset];
-        arg_state->num_strings = conn->read_strings;
+        cmd_len = ntohl(cmd_len);
+        size_t arg_offset = conn->rbuf_offset + REQUEST_TYPE_LEN +
+                            2 * SIZE_SEGMENT_LEN + cmd_len;
+        arg_state->saveptr = &conn->rbuf[arg_offset];
+        arg_state->num_tokens = conn->read_tokens;
     } else {
         *arg_state->saveptr = arg_state->bak;
-        if(arg_state->num_strings == 1)
-            return NULL;
+        if(arg_state->num_tokens == 1)
+            return false;
     }
 
-    uint32_t tok_len;
-    memcpy(&tok_len, arg_state->saveptr, SIZE_SEGMENT_LEN);
-    arg_state->saveptr += SIZE_SEGMENT_LEN;
-    char *tok = arg_state->saveptr;
-    arg_state->bak = tok[tok_len];
-    tok[tok_len] = 0;
-    arg_state->saveptr += tok_len;
-    arg_state->num_strings--;
-    return tok;
+    uint8_t token_type = *arg_state->saveptr++;
+    uint32_t str_len;
+    switch(token_type) {
+    case REQ_INT:
+        arg->type = ARG_INT;
+        memcpy(&arg->int_arg, arg_state->saveptr, INT_LEN);
+        arg->int_arg = ntohl(arg->int_arg);
+        arg_state->saveptr += INT_LEN;
+        arg_state->bak = *arg_state->saveptr;
+        break;
+    case REQ_DOUBLE:
+        arg->type = ARG_DOUBLE;
+        memcpy(&arg->double_arg, arg_state->saveptr, DOUBLE_LEN);
+        arg->double_arg = ntohd(arg->double_arg);
+        arg_state->saveptr += DOUBLE_LEN;
+        arg_state->bak = *arg_state->saveptr;
+        break;
+    case REQ_STR:
+        arg->type = ARG_STRING;
+        memcpy(&str_len, arg_state->saveptr, SIZE_SEGMENT_LEN);
+        str_len = ntohl(str_len);
+        arg->str_arg = (char*)(arg_state->saveptr + SIZE_SEGMENT_LEN);
+        arg_state->saveptr = (uint8_t*)(arg->str_arg + str_len);
+        arg_state->bak = *arg_state->saveptr;
+        *arg_state->saveptr = 0;
+        break;
+    }
+
+    arg_state->num_tokens--;
+    return true;
+}
+
+bool next_int_arg(CmdArgState *arg_state, uint32_t *arg) {
+    Arg arg_struct;
+    if(!next_cmd_arg(arg_state, &arg_struct))
+        return false;
+    if(arg_struct.type != ARG_INT) {
+        send_err(ERR_VALUE_IS_NOT_INT);
+        return false;
+    }
+    *arg = arg_struct.int_arg;
+    return true;
+}
+
+bool next_double_arg(CmdArgState *arg_state, double *arg) {
+    Arg arg_struct;
+    if(!next_cmd_arg(arg_state, &arg_struct))
+        return false;
+    if(arg_struct.type != ARG_DOUBLE) {
+        send_err(ERR_VALUE_IS_NOT_FLOAT);
+        return false;
+    }
+    *arg = arg_struct.double_arg;
+    return true;
+}
+
+bool next_string_arg(CmdArgState *arg_state, char **arg) {
+    Arg arg_struct;
+    if(!next_cmd_arg(arg_state, &arg_struct))
+        return false;
+    if(arg_struct.type != ARG_STRING) {
+        send_err(ERR_VALUE_IS_NOT_STRING);
+        return false;
+    }
+    *arg = arg_struct.str_arg;
+    return true;
+}
+
+void cmd_restore(CmdArgState *arg_state) {
+    *arg_state->saveptr = arg_state->bak;
 }
 
 static inline bool read_command(void) {
@@ -400,8 +494,8 @@ static inline bool read_command(void) {
     conn->rbuf_size += read_bytes;
 
     size_t next_cmd_len;
-    PrepareResult prepare_result = prepare_command(&next_cmd_len);
-    switch(prepare_result) {
+    CommandCheckResult check_result = check_command_was_read(&next_cmd_len);
+    switch(check_result) {
     case CommandPartiallyRead:
         if(conn->rbuf_offset + next_cmd_len > MAX_COMMAND_LEN) {
             memmove(conn->rbuf, &conn->rbuf[conn->rbuf_offset], conn->rbuf_size);
@@ -411,7 +505,7 @@ static inline bool read_command(void) {
     case CommandReadSuccess:
         return true;
     default:
-        send_prepare_error(prepare_result);
+        send_command_error(check_result);
         return false;
     }
 }
@@ -419,12 +513,11 @@ static inline bool read_command(void) {
 static inline void process_request(void) {
     Conn *conn = state.current_client;
     uint32_t cmd_name_len;
-    memcpy(
-        &cmd_name_len,
-        &conn->rbuf[conn->rbuf_offset + SIZE_SEGMENT_LEN],
-        SIZE_SEGMENT_LEN
-    );
-    char *cmd_name = (char*)&conn->rbuf[conn->rbuf_offset + 2 * SIZE_SEGMENT_LEN];
+    size_t offset = conn->rbuf_offset + SIZE_SEGMENT_LEN + REQUEST_TYPE_LEN;
+    char *buf = (char*)&conn->rbuf[offset];
+    memcpy(&cmd_name_len, buf, SIZE_SEGMENT_LEN);
+    cmd_name_len = ntohl(cmd_name_len);
+    char *cmd_name = &buf[SIZE_SEGMENT_LEN];
     char bak = cmd_name[cmd_name_len];
     cmd_name[cmd_name_len] = 0;
 
@@ -459,20 +552,20 @@ static inline void handle_read_event(void) {
         can_process_more = !conn->should_close;
     }
 
-    PrepareResult prepare_result = CommandReadSuccess;
+    CommandCheckResult check_result = CommandReadSuccess;
 
     while(can_process_more && conn->rbuf_size > 2 * SIZE_SEGMENT_LEN) {
         size_t next_cmd_len;
-        prepare_result = prepare_command(&next_cmd_len);
+        check_result = check_command_was_read(&next_cmd_len);
 
-        if(prepare_result == CommandPartiallyRead) {
+        if(check_result == CommandPartiallyRead) {
             if(conn->rbuf_offset + next_cmd_len > MAX_COMMAND_LEN) {
                 memmove(conn->rbuf, &conn->rbuf[conn->rbuf_offset], conn->rbuf_size);
                 conn->rbuf_offset = 0;
             }
             break;
-        } else if(prepare_result != CommandReadSuccess) {
-            send_prepare_error(prepare_result);
+        } else if(check_result != CommandReadSuccess) {
+            send_command_error(check_result);
             break;
         }
 

@@ -4,43 +4,114 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <errno.h>
 #include <unistd.h>
+#include <inttypes.h>
+#include <math.h>
+#include <limits.h>
+#include <ctype.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include "proto.h"
 #include "util.h"
+#include "hashtable.h"
 
-#define MAX_ERROR_LEN              256
-#define OUTPUT_BUF_SIZE            (2 * (MAX_RESPONSE_LEN + MAX_ERROR_LEN))
-#define RESPONSE_IS_TOO_LONG_ERROR "ERR: response is too long\n"
-#define WRONG_RESPONSE_TYPE_ERROR  "ERR: wrong response status type\n"
-#define COMMAND_IS_TOO_LONG_ERROR  "ERR: command is too long\n"
-#define EMPTY_REQUEST_ERROR        "ERR: empty request\n"
-#define UNKNOWN_ERROR_CODE         "unknown"
+#define MAX_ERROR_LEN               256
+#define OUTPUT_BUF_SIZE             (2 * (MAX_RESPONSE_LEN + MAX_ERROR_LEN))
+#define RESPONSE_IS_TOO_LONG_ERROR  "ERR: response is too long\n"
+#define WRONG_RESPONSE_TYPE_ERROR   "ERR: wrong response status type\n"
+#define COMMAND_IS_TOO_LONG_ERROR   "ERR: command is too long\n"
+#define EMPTY_REQUEST_ERROR         "ERR: empty request\n"
+#define UNDEFINED_COMMAND           "undefined command"
+#define UNDEFINED_COMMAND_ERROR     "ERR: " UNDEFINED_COMMAND "\n"
+#define WRONG_ARGUMENTS_COUNT       "wrong number of arguments"
+#define WRONG_ARGUMENTS_COUNT_ERROR "ERR: " WRONG_ARGUMENTS_COUNT "\n"
+#define UNKNOWN_ERROR_CODE          "unknown"
+#define VALUE_IS_NOT_INT            "value is not an integer"
+#define VALUE_IS_NOT_INT_ERROR      "ERR: " VALUE_IS_NOT_INT "\n"
+#define VALUE_IS_NOT_FLOAT          "value is not a float"
+#define VALUE_IS_NOT_FLOAT_ERROR    "ERR: " VALUE_IS_NOT_FLOAT "\n"
+#define MAX_ARGUMENTS               10
+#define ARRAY_SIZE(arr)             sizeof(arr)/sizeof(*arr)
 
 typedef struct {
     char   *message;
     size_t len;
 } ErrorMessage;
 
+typedef enum {
+    ARG_UINT,
+    ARG_INT,
+    ARG_DOUBLE,
+    ARG_STR
+} ArgType;
+
+typedef struct {
+    bool    is_enabled;
+    ArgType args[MAX_ARGUMENTS];
+} ArgsList;
+
+static struct {
+    char     *name;
+    ArgsList args_lists[MAX_ARGUMENTS];
+} commands_info[] = {
+    { "GET", { [0] = { true, { ARG_STR } } } },
+    { "SET", { [1] = { true, { ARG_STR, ARG_STR } } } },
+    { "DEL", { [0] = { true, { ARG_STR } } } },
+    { "KEYS", { } },
+    { "ZADD", { [2] = { true, { ARG_STR, ARG_DOUBLE, ARG_STR } } } },
+    { "ZRANGE", {
+        [2] = { true, { ARG_STR, ARG_DOUBLE, ARG_DOUBLE } },
+        [3] = { true, { ARG_STR, ARG_DOUBLE, ARG_DOUBLE, ARG_STR } },
+        [4] = { true, { ARG_STR, ARG_DOUBLE, ARG_DOUBLE, ARG_UINT, ARG_UINT } },
+        [5] = { true, { ARG_STR, ARG_DOUBLE, ARG_DOUBLE, ARG_UINT, ARG_UINT, ARG_STR } }
+    } },
+    { "ZREM", { [1] = { true, { ARG_STR, ARG_STR } } } },
+    { "ZCARD", { [0] = { true, { ARG_STR } } } },
+    { "ZSCORE", { [1] = { true, { ARG_STR, ARG_STR } } } }
+};
+
+static HashTable* init_commands(void) {
+    HashTable *commands = hash_table_new(NULL, NULL, ARRAY_SIZE(commands_info));
+    if(!commands)
+        return NULL;
+
+    for(size_t i = 0; i < ARRAY_SIZE(commands_info); i++) {
+        HashTableNode *node = hash_table_set(
+            commands,
+            commands_info[i].name,
+            commands_info[i].args_lists
+        );
+        if(!node) {
+            hash_table_free(commands);
+            return NULL;
+        }
+    }
+
+    return commands;
+}
+
 #define ERROR_MESSAGE(type, msg) [type] = { msg, sizeof(msg) - 1 }
 
 static const ErrorMessage error_messages[] = {
     ERROR_MESSAGE(ERR_COMMAND_IS_TOO_LONG, "command is too long"),
     ERROR_MESSAGE(ERR_ZERO_SEGMENT, "command contains zero length segment"),
-    ERROR_MESSAGE(ERR_UNDEFINED_COMMAND, "undefined command"),
+    ERROR_MESSAGE(ERR_UNDEFINED_COMMAND, UNDEFINED_COMMAND),
     ERROR_MESSAGE(ERR_OUT_OF_MEMORY, "out of memory"),
-    ERROR_MESSAGE(ERR_ARITY, "wrong number of arguments"),
+    ERROR_MESSAGE(ERR_ARITY, WRONG_ARGUMENTS_COUNT),
     ERROR_MESSAGE(ERR_RESPONSE_IS_TOO_LONG, "response is too long"),
     ERROR_MESSAGE(ERR_TYPE_MISMATCH,
         "trying to perform operation against key with wrong type"
     ),
-    ERROR_MESSAGE(ERR_VALUE_IS_NOT_FLOAT, "value is not a float"),
-    ERROR_MESSAGE(ERR_VALUE_IS_NOT_INT, "value is not an integer")
+    ERROR_MESSAGE(ERR_VALUE_IS_NOT_FLOAT, VALUE_IS_NOT_FLOAT),
+    ERROR_MESSAGE(ERR_VALUE_IS_NOT_INT, VALUE_IS_NOT_INT),
+    ERROR_MESSAGE(ERR_VALUE_IS_NOT_STRING, "value is not a string"),
+    ERROR_MESSAGE(ERR_UNKNOWN_TOKEN_TYPE, "token type is unknown"),
+    ERROR_MESSAGE(ERR_COMMAND_NAME_IS_NOT_STRING, "command name must be a string")
 };
 
-static_assert(sizeof(error_messages) / sizeof(*error_messages) == ERR_MAX);
+static_assert(ARRAY_SIZE(error_messages) == ERR_MAX);
 
 typedef enum {
     REQ_OK,
@@ -124,6 +195,56 @@ static size_t utoa(size_t num, char *buf) {
     return size;
 }
 
+static bool string2d(const char *str, double *d) {
+    char *endpptr;
+    size_t len = strlen(str);
+    *d = strtod(str, &endpptr);
+    if(isspace(str[0]) ||
+       (endpptr - str) != len ||
+       (errno == ERANGE &&
+        (*d == HUGE_VAL || *d == -HUGE_VAL || fpclassify(*d) == FP_ZERO)))
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool string2l(const char *str, long *i) {
+    char *endpptr;
+    size_t len = strlen(str);
+    *i = strtol(str, &endpptr, 10);
+    if(isspace(str[0]) ||
+       (endpptr - str) != len ||
+       (errno == ERANGE && (*i == LONG_MAX || *i == LONG_MIN)))
+    {
+        return false;
+    }
+    return true;
+}
+
+static bool string2ul(const char *str, unsigned long *i) {
+    char *endpptr;
+    size_t len = strlen(str);
+    *i = strtoul(str, &endpptr, 10);
+    if(isspace(str[0]) || str[0] == '-' ||
+       (endpptr - str) != len ||
+       (errno == ERANGE && *i == ULONG_MAX))
+    {
+        return false;
+    }
+    return true;
+}
+
+static size_t chrcnt(char *str, char c) {
+    size_t result = 0;
+    while(*str != 0) {
+        if(*str == c)
+            result++;
+        str++;
+    }
+    return result;
+}
+
 static bool write_to_output(Output *out, const char *buf, size_t size) {
     size_t new_size = out->buf_size + size;
     if(new_size <= OUTPUT_BUF_SIZE) {
@@ -196,7 +317,7 @@ static inline bool print_response(
         res &= write_to_output(
             out,
             &buf[RESPONSE_TYPE_LEN + SIZE_SEGMENT_LEN],
-            msg_len - RESPONSE_TYPE_LEN
+            msg_len - SIZE_SEGMENT_LEN
         );
         res &= write_to_output(out, "\"", 1);
         break;
@@ -237,7 +358,7 @@ static bool read_and_print_response(
     Output *out,
     size_t num_responses
 ) {
-    uint32_t type;
+    uint8_t type;
     size_t msg_len;
     size_t arr_size = 0;
     size_t buf_size = 0, buf_offset = 0, cur_len;
@@ -266,8 +387,7 @@ static bool read_and_print_response(
             }
 
             if(!is_type_set) {
-                memcpy(&type, &buf[buf_offset], RESPONSE_TYPE_LEN);
-                type = ntohl(type);
+                type = buf[buf_offset];
                 if(type >= RES_MAX) {
                     fputs(WRONG_RESPONSE_TYPE_ERROR, stderr);
                     return -1;
@@ -349,7 +469,8 @@ static RequestStatus request(
     int sockfd,
     char *cmd_buf,
     char *request_buf,
-    size_t *num_requests_res
+    size_t *num_requests_res,
+    HashTable *commands
 ) {
     char *cmd_save, *tok_save;
     size_t req_size = 0;
@@ -364,35 +485,119 @@ static RequestStatus request(
 
     char *cmd = strtok_r(cmd_buf, ";", &cmd_save);
     while(cmd) {
-        uint32_t num_strings = 0;
+        size_t args_count = chrcnt(cmd, ' ');
+        if(args_count >= MAX_ARGUMENTS) {
+            fputs(WRONG_ARGUMENTS_COUNT_ERROR, stderr);
+            return REQ_WARN;
+        }
+
+        ArgType *args = NULL;
+        uint32_t num_tokens = 0;
         char *token = strtok_r(cmd, " ", &tok_save);
         size_t cur_cmd_offset = req_size;
         req_size += SIZE_SEGMENT_LEN;
         while(token) {
-            num_strings++;
-            size_t len = strlen(token);
-            size_t segment_len = SIZE_SEGMENT_LEN + len;
-            size_t next_req_size = req_size + segment_len;
+            ArgType arg_type;
+            if(num_tokens == 0) {
+                HashTableNode *node = hash_table_get(commands, token);
+                if(!node) {
+                    fputs(UNDEFINED_COMMAND_ERROR, stderr);
+                    return REQ_WARN;
+                }
+                ArgsList *args_lists = node->value;
+                if(args_count != 0) {
+                    if(!args_lists[args_count - 1].is_enabled) {
+                        fputs(WRONG_ARGUMENTS_COUNT_ERROR, stderr);
+                        return REQ_WARN;
+                    } else {
+                        args = args_lists[args_count - 1].args;
+                    }
+                }
+                arg_type = ARG_STR;
+            } else {
+                arg_type = *args++;
+            }
+
+            size_t next_req_size, str_len;
+            switch(arg_type) {
+            case ARG_STR:
+                str_len = strlen(token);
+                next_req_size = req_size + SIZE_SEGMENT_LEN + str_len;
+                break;
+            case ARG_INT:
+            case ARG_UINT:
+                next_req_size = req_size + INT_LEN;
+                break;
+            case ARG_DOUBLE:
+                next_req_size = req_size + DOUBLE_LEN;
+                break;
+            }
+            next_req_size += REQUEST_TYPE_LEN;
+
             if(next_req_size > MAX_COMMAND_LEN) {
                 fputs(COMMAND_IS_TOO_LONG_ERROR, stderr);
                 return REQ_WARN;
             }
 
-            uint32_t len32 = len;
-            len32 = htonl(len32);
-            memcpy(&request_buf[req_size], &len32, SIZE_SEGMENT_LEN);
-            memcpy(&request_buf[req_size + SIZE_SEGMENT_LEN], token, len);
+            uint32_t str_len_32;
+            double double_val;
+            long int_val;
+            unsigned long uint_val;
+            uint32_t int32_val;
+            char *buf = &request_buf[req_size];
+            uint8_t token_type;
+            switch(arg_type) {
+            case ARG_STR:
+                token_type = REQ_STR;
+                str_len_32 = str_len;
+                str_len_32 = htonl(str_len_32);
+                memcpy(&buf[REQUEST_TYPE_LEN], &str_len_32, SIZE_SEGMENT_LEN);
+                memcpy(&buf[REQUEST_TYPE_LEN + SIZE_SEGMENT_LEN], token, str_len);
+                break;
+            case ARG_INT:
+                if(!string2l(token, &int_val)) {
+                    fputs(VALUE_IS_NOT_INT_ERROR, stderr);
+                    return REQ_WARN;
+                }
+                int32_val = int_val;
+                int32_val = htonl(int32_val);
+                memcpy(&buf[REQUEST_TYPE_LEN], &int32_val, INT_LEN);
+                token_type = REQ_INT;
+                break;
+            case ARG_UINT:
+                if(!string2ul(token, &uint_val)) {
+                    fputs(VALUE_IS_NOT_INT_ERROR, stderr);
+                    return REQ_WARN;
+                }
+                int32_val = uint_val;
+                int32_val = htonl(int32_val);
+                memcpy(&buf[REQUEST_TYPE_LEN], &int32_val, INT_LEN);
+                token_type = REQ_INT;
+                break;
+            case ARG_DOUBLE:
+                if(!string2d(token, &double_val)) {
+                    fputs(VALUE_IS_NOT_FLOAT_ERROR, stderr);
+                    return REQ_WARN;
+                }
+                double_val = htond(double_val);
+                memcpy(&buf[REQUEST_TYPE_LEN], &double_val, DOUBLE_LEN);
+                token_type = REQ_DOUBLE;
+                break;
+            }
+            *buf = token_type;
+
             req_size = next_req_size;
+            num_tokens++;
             token = strtok_r(NULL, " ", &tok_save);
         }
 
-        if(num_strings == 0) {
+        if(num_tokens == 0) {
             fputs(EMPTY_REQUEST_ERROR, stderr);
             return REQ_WARN;
         }
 
-        num_strings = htonl(num_strings);
-        memcpy(&request_buf[cur_cmd_offset], &num_strings, SIZE_SEGMENT_LEN);
+        num_tokens = htonl(num_tokens);
+        memcpy(&request_buf[cur_cmd_offset], &num_tokens, SIZE_SEGMENT_LEN);
         cmd = strtok_r(NULL, ";", &cmd_save);
         num_requests++;
     }
@@ -431,6 +636,7 @@ int main(void) {
     char *line = NULL, *request_buf = NULL;
     size_t num_requests;
     char *response_buf = NULL;
+    HashTable *commands = NULL;
     Output output = {0};
     int result = EXIT_FAILURE;
 
@@ -455,6 +661,10 @@ int main(void) {
     if(!init_output(&output))
         goto exit;
 
+    commands = init_commands();
+    if(!commands)
+        goto exit;
+
     bool is_end = false;
     while(!is_end) {
         int sockfd = connect_to_server();
@@ -471,7 +681,8 @@ int main(void) {
                 sockfd,
                 line,
                 request_buf,
-                &num_requests
+                &num_requests,
+                commands
             );
             if(status == REQ_WARN)
                 continue;
@@ -491,6 +702,7 @@ exit:
     if(line) free(line);
     if(request_buf) free(request_buf);
     if(response_buf) free(response_buf);
+    if(commands) hash_table_free(commands);
     free_output(&output);
     return result;
 }
