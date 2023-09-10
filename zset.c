@@ -420,7 +420,7 @@ void zadd_handler(void) {
         goto error;
     }
 
-    if(!get_zset_by_key(key, &zset)) {
+    if(!get_zset_by_key(state.keys, key, &zset)) {
         should_send_error = false;
         goto error;
     }
@@ -564,7 +564,7 @@ void zrange_handler(void) {
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    if(!get_zset_by_key(key, &zset))
+    if(!get_zset_by_key(state.keys, key, &zset))
         goto end;
 
     if(!zset) {
@@ -646,7 +646,7 @@ void zrem_handler(void) {
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    if(!get_zset_by_key(key, &zset))
+    if(!get_zset_by_key(state.keys, key, &zset))
         goto end;
 
     if(!zset) {
@@ -678,7 +678,7 @@ void zcard_handler(void) {
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    if(!get_zset_by_key(key, &zset))
+    if(!get_zset_by_key(state.keys, key, &zset))
         goto end;
 
     if(!zset) {
@@ -701,7 +701,7 @@ void zscore_handler(void) {
     if(!next_string_arg(&arg_state, &key))
         goto end;
 
-    if(!get_zset_by_key(key, &zset))
+    if(!get_zset_by_key(state.keys, key, &zset))
         goto end;
 
     if(!zset) {

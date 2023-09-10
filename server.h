@@ -4,6 +4,7 @@
 #define RESERVED_FDS       256
 #define PORT               5000
 #define INIT_KEYS_CAPACITY 2048
+#define INIT_TTL_CAPACITY  2048
 #define MAX_ACCEPTS        20
 
 #include <stdint.h>
@@ -14,6 +15,8 @@
 #include "hashtable.h"
 #include "object.h"
 #include "zset.h"
+#include "hashtable.h"
+#include "bheap.h"
 
 typedef struct {
     int      fd;
@@ -27,6 +30,8 @@ typedef struct {
     bool     should_close;
 } Conn;
 
+typedef uint64_t mstime;
+
 typedef struct {
     size_t    max_clients;
     uint16_t  port;
@@ -36,6 +41,8 @@ typedef struct {
     Conn      *connections;
     HashTable *keys;
     HashTable *commands;
+    BHeap     *ttl_heap;
+    mstime    cmd_start_time;
 } State;
 
 extern State state;
@@ -86,8 +93,9 @@ bool send_err(ErrorCode code);
 bool send_arr(void);
 void end_arr(uint32_t size);
 
-bool get_string_by_key(const char *key, char **string);
-bool get_zset_by_key(const char *key, ZSet **zset);
+HashTableNode* lookup_key(HashTable *htable, const char *key);
+bool get_string_by_key(HashTable *htable, const char *key, char **string);
+bool get_zset_by_key(HashTable *htable, const char *key, ZSet **zset);
 
 // key-value commands
 void get_handler(void);
@@ -101,3 +109,8 @@ void zrange_handler(void);
 void zrem_handler(void);
 void zcard_handler(void);
 void zscore_handler(void);
+
+// ttl commands
+void expire_handler(void);
+void ttl_handler(void);
+void persist_handler(void);

@@ -2,7 +2,6 @@
 
 #include <stddef.h>
 #include <stdbool.h>
-#include <time.h>
 
 #define EVENT_NONE  0x0
 #define EVENT_READ  0x1
@@ -20,6 +19,6 @@ typedef struct {
 } EventLoop;
 
 EventLoop* create_event_loop(size_t max_events);
-int poll_events(EventLoop *event_loop, const struct timespec *tv);
+int poll_events(EventLoop *event_loop, int timeout);
 bool set_event_mask(EventLoop *event_loop, int fd, int mask, bool is_modify);
 void free_event_loop(EventLoop *event_loop);

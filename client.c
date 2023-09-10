@@ -35,6 +35,10 @@
 #define MAX_ARGUMENTS               10
 #define ARRAY_SIZE(arr)             sizeof(arr)/sizeof(*arr)
 
+#ifndef INADDR_LOOPBACK
+#define INADDR_LOOPBACK 0x7f000001
+#endif
+
 typedef struct {
     char   *message;
     size_t len;
@@ -69,7 +73,10 @@ static struct {
     } },
     { "ZREM", { [1] = { true, { ARG_STR, ARG_STR } } } },
     { "ZCARD", { [0] = { true, { ARG_STR } } } },
-    { "ZSCORE", { [1] = { true, { ARG_STR, ARG_STR } } } }
+    { "ZSCORE", { [1] = { true, { ARG_STR, ARG_STR } } } },
+    { "EXPIRE", { [1] = { true, { ARG_STR, ARG_UINT } } } },
+    { "TTL", { [0] = { true, { ARG_STR } } } },
+    { "PERSIST", { [0] = { true, { ARG_STR } } } }
 };
 
 static HashTable* init_commands(void) {
@@ -111,7 +118,7 @@ static const ErrorMessage error_messages[] = {
     ERROR_MESSAGE(ERR_COMMAND_NAME_IS_NOT_STRING, "command name must be a string")
 };
 
-static_assert(ARRAY_SIZE(error_messages) == ERR_MAX);
+static_assert(ARRAY_SIZE(error_messages) == ERR_MAX, "All errors must have messages");
 
 typedef enum {
     REQ_OK,
@@ -286,23 +293,25 @@ static inline bool print_response(
     }
 
     bool res = true;
+    uint32_t error_code;
+    uint32_t ival;
+    double dval;
     switch(type) {
     case RES_NIL:
         res = write_to_output(out, "nil", 3);
         break;
     case RES_ERR:
-        uint32_t code;
-        memcpy(&code, &buf[RESPONSE_TYPE_LEN], INT_LEN);
-        code = ntohl(code);
+        memcpy(&error_code, &buf[RESPONSE_TYPE_LEN], INT_LEN);
+        error_code = ntohl(error_code);
 
         const char *error_message;
         size_t error_message_len;
-        if(code >= ERR_MAX) {
+        if(error_code >= ERR_MAX) {
             error_message = UNKNOWN_ERROR_CODE;
             error_message_len = sizeof(UNKNOWN_ERROR_CODE) - 1;
         } else {
-            error_message = error_messages[code].message;
-            error_message_len = error_messages[code].len;
+            error_message = error_messages[error_code].message;
+            error_message_len = error_messages[error_code].len;
         }
 
         res = write_to_output(out, "ERR: ", 5);
@@ -323,7 +332,6 @@ static inline bool print_response(
         break;
     case RES_INT:
     case RES_UINT:
-        uint32_t ival;
         memcpy(&ival, &buf[RESPONSE_TYPE_LEN], INT_LEN);
         ival = ntohl(ival);
         if(type == RES_INT)
@@ -333,7 +341,6 @@ static inline bool print_response(
         res = write_to_output(out, num_buf, num_size);
         break;
     case RES_DOUBLE:
-        double dval;
         memcpy(&dval, &buf[RESPONSE_TYPE_LEN], DOUBLE_LEN);
         dval = ntohd(dval);
         num_size = snprintf(num_buf, sizeof(num_buf), "%lf", dval);

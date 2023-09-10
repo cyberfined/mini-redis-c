@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/event.h>
 #include "event.h"
 
@@ -60,14 +61,23 @@ void free_event_api(EventLoop *event_loop) {
     free(data);
 }
 
-int poll_events(EventLoop *event_loop, const struct timespec *tv) {
+int poll_events(EventLoop *event_loop, int timeout) {
     KqueueData *data = event_loop->api_data;
+
+    struct timespec tp, *tp_ptr;
+    if(timeout < 0) {
+        tp_ptr = NULL;
+    } else {
+        tp.tv_sec = timeout / 1000;
+        tp.tv_nsec = timeout - tp.tv_sec * 1000;
+        tp_ptr = &tp;
+    }
 
     int num_events = kevent(
         data->kq,
         NULL, 0,
         data->event_list, event_loop->max_events,
-        tv
+        tp_ptr
     );
     if(num_events < 0) {
         perror("poll_events (kqueue) (kevent)");

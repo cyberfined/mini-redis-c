@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #include <signal.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -24,15 +25,18 @@ static struct {
     char    *name;
     Command command;
 } commands[] = {
-    { "GET",    { .min_args = 1, .max_args = 1, .handler = get_handler    } },
-    { "SET",    { .min_args = 2, .max_args = 2, .handler = set_handler    } },
-    { "DEL",    { .min_args = 1, .max_args = 1, .handler = del_handler    } },
-    { "KEYS",   { .min_args = 0, .max_args = 0, .handler = keys_handler   } },
-    { "ZADD",   { .min_args = 3, .max_args = 3, .handler = zadd_handler   } },
-    { "ZRANGE", { .min_args = 3, .max_args = 6, .handler = zrange_handler } },
-    { "ZREM",   { .min_args = 2, .max_args = 2, .handler = zrem_handler   } },
-    { "ZCARD",  { .min_args = 1, .max_args = 1, .handler = zcard_handler  } },
-    { "ZSCORE", { .min_args = 2, .max_args = 2, .handler = zscore_handler } }
+    { "GET",     { .min_args = 1, .max_args = 1, .handler = get_handler     } },
+    { "SET",     { .min_args = 2, .max_args = 2, .handler = set_handler     } },
+    { "DEL",     { .min_args = 1, .max_args = 1, .handler = del_handler     } },
+    { "KEYS",    { .min_args = 0, .max_args = 0, .handler = keys_handler    } },
+    { "ZADD",    { .min_args = 3, .max_args = 3, .handler = zadd_handler    } },
+    { "ZRANGE",  { .min_args = 3, .max_args = 6, .handler = zrange_handler  } },
+    { "ZREM",    { .min_args = 2, .max_args = 2, .handler = zrem_handler    } },
+    { "ZCARD",   { .min_args = 1, .max_args = 1, .handler = zcard_handler   } },
+    { "ZSCORE",  { .min_args = 2, .max_args = 2, .handler = zscore_handler  } },
+    { "EXPIRE",  { .min_args = 2, .max_args = 2, .handler = expire_handler  } },
+    { "TTL",     { .min_args = 1, .max_args = 1, .handler = ttl_handler     } },
+    { "PERSIST", { .min_args = 1, .max_args = 1, .handler = persist_handler } }
 };
 
 typedef enum {
@@ -254,31 +258,6 @@ void end_arr(uint32_t size) {
     size = htonl(size);
     *buf = RES_ARR;
     memcpy(&buf[RESPONSE_TYPE_LEN], &size, SIZE_SEGMENT_LEN);
-}
-
-static inline bool assert_type_get(ObjectType type, const char *key, void **value) {
-    HashTableNode *node = hash_table_get(state.keys, key);
-    if(!node) {
-        *value = NULL;
-        return true;
-    }
-
-    Object *obj = node->value;
-    if(obj->type != type) {
-        send_err(ERR_TYPE_MISMATCH);
-        return false;
-    }
-
-    *value = obj->ptr;
-    return true;
-}
-
-bool get_string_by_key(const char *key, char **string) {
-    return assert_type_get(OBJ_STRING, key, (void**)string);
-}
-
-bool get_zset_by_key(const char *key, ZSet **zset) {
-    return assert_type_get(OBJ_ZSET, key, (void**)zset);
 }
 
 static inline void send_command_error(CommandCheckResult error) {
@@ -539,6 +518,12 @@ static inline bool read_command(void) {
     }
 }
 
+static inline mstime current_time_ms(void) {
+    struct timespec tp;
+    clock_gettime(CLOCK_MONOTONIC, &tp);
+    return tp.tv_sec * 1000 + tp.tv_nsec / 1000000;
+}
+
 static inline void process_request(void) {
     Conn *conn = state.current_client;
     uint32_t cmd_name_len;
@@ -557,8 +542,10 @@ static inline void process_request(void) {
         send_err(ERR_UNDEFINED_COMMAND);
     } else {
         Command *command = command_node->value;
-        if(check_arity(command))
+        if(check_arity(command)) {
+            state.cmd_start_time = current_time_ms();
             command->handler();
+        }
     }
 
     conn->rbuf_size -= conn->cmd_len;
@@ -660,6 +647,7 @@ static void free_server(void) {
     }
     if(state.keys) hash_table_free(state.keys);
     if(state.commands) hash_table_free(state.commands);
+    if(state.ttl_heap) bheap_free(state.ttl_heap);
 }
 
 static inline bool init_server(void) {
@@ -736,7 +724,36 @@ static inline bool init_server(void) {
     if(!init_commands())
         return false;
 
+    state.ttl_heap = bheap_new(INIT_TTL_CAPACITY);
+    if(!state.ttl_heap)
+        return false;
+
     return true;
+}
+
+static inline int next_timer_ms(void) {
+    BHeapElem *min = bheap_peek_min(state.ttl_heap);
+    if(!min)
+        return -1;
+
+    int diff = min->expires_at - current_time_ms();
+    if(diff < 0)
+        return 0;
+    return diff;
+}
+
+static void process_timers(void) {
+    mstime cur_time = current_time_ms();
+
+    for(;;) {
+        BHeapElem *min_ptr = bheap_peek_min(state.ttl_heap);
+        if(!min_ptr || min_ptr->expires_at > cur_time)
+            break;
+
+        BHeapElem min;
+        bheap_extract_min(state.ttl_heap, &min);
+        hash_table_remove(state.keys, min.node);
+    }
 }
 
 static void sigint_handler(int signum) {
@@ -764,9 +781,11 @@ int main(void) {
         goto exit;
 
     for(;;) {
-        int num_events = poll_events(state.event_loop, NULL);
+        int num_events = poll_events(state.event_loop, next_timer_ms());
         for(int i = 0; i < num_events; i++)
             handle_event(&state.event_loop->events[i]);
+
+        process_timers();
     }
 
     result = 0;

@@ -46,14 +46,8 @@ void free_event_api(EventLoop *event_loop) {
     free(data);
 }
 
-int poll_events(EventLoop *event_loop, const struct timespec *tv) {
+int poll_events(EventLoop *event_loop, int timeout) {
     EpollData *data = event_loop->api_data;
-
-    int timeout;
-    if(!tv)
-        timeout = -1;
-    else
-        timeout = tv->tv_sec * 1000 + tv->tv_nsec / 1000000;
 
     int num_events = epoll_wait(
         data->epfd,

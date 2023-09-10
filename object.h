@@ -1,6 +1,7 @@
 #pragma once
 
 #include "zset.h"
+#include "bheap.h"
 
 typedef enum {
     OBJ_STRING,
@@ -10,6 +11,7 @@ typedef enum {
 typedef struct {
     ObjectType type;
     void       *ptr;
+    size_t     ttl_idx;
 } Object;
 
 Object* createStringObject(char *str);
